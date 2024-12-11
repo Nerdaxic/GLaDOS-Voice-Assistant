@@ -16,7 +16,7 @@ load_dotenv(dotenv_path=os.path.dirname(os.path.abspath(__file__))+'/settings.en
 import shutil
 import subprocess
 
-if(os.getenv('TTS_ENGINE_API') == ''): from glados_tts.engine import *
+#if(os.getenv('TTS_ENGINE_API') == ''): from glados_tts.engine import *
 from glados_functions import *
 
 synthFolder = os.getenv('TTS_CACHE_FOLDER') + "/"
@@ -70,13 +70,13 @@ def fetchTTSSample(line, cache=False):
         # If cache is True, generate and save the audio file
         command = [
             "bash", "-c",
-            f'echo "{line}" | piper -m glados_tts/models/glados.onnx --output-raw | tee >(aplay -q -r 22050 -f S16_LE -t raw -) | sox -t raw -r 22050 -b 16 -e signed-integer -c 1 - "{output_path}"'
+            f'echo "{line}" | piper -m models/piper/glados.onnx --output-raw | tee >(aplay -q -r 22050 -f S16_LE -t raw -) | sox -t raw -r 22050 -b 16 -e signed-integer -c 1 - "{output_path}"'
         ]
     else:
         # If cache is False, generate and play audio without saving
         command = [
             "bash", "-c",
-            f'echo "{line}" | piper -m glados_tts/models/glados.onnx --output-raw | aplay -q -r 22050 -f S16_LE -t raw -'
+            f'echo "{line}" | piper -m models/piper/glados.onnx --output-raw | aplay -q -r 22050 -f S16_LE -t raw -'
         ]
 
     # Use subprocess.call to run the command and save wav file
