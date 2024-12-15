@@ -125,13 +125,13 @@ def speak(line, cache=False):
         if eye_position_script(line) == False:
             eye_position_random()
 
-        print("\033[1;33mGLaDOS:\033[0;37m " + line.capitalize())
+        print("\033[1;33m[GLaDOS]\033[0;37m " + line.capitalize())
         # Speak from cache
         playFile(file)
 
     # TTS Sample not in cache...
     else:
-        print("\033[1;94mINFO:\033[;97m The audio sample does not exist, generating...")
+        print("\033[1;94m[INFO]\033[;97m The audio sample does not exist, generating...")
         setEyeAnimation("wait")
 
         # Generate line and save to TTS-folder
@@ -142,7 +142,7 @@ def speak(line, cache=False):
             if eye_position_script(line) == False:
                 eye_position_random()
 
-            print("\033[1;33mGLaDOS:\033[0;37m " + line.capitalize())
+            print("\033[1;33m[GLaDOS]\033[0;37m " + line.capitalize())
 
             # Speak
             #playFile("./audio/GLaDOS-tts-temp-output.wav")

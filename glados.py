@@ -9,6 +9,7 @@
 #
 #    Local wakeword detection using openWakeWord
 #    Using local Speech-to-Text using OpenAI's Whisper
+#    Using local Text-to-Speech using Piper
 #    Works with Home Assistant
 #
 #    https://github.com/nerdaxic/glados-voice-assistant/
@@ -17,7 +18,8 @@
 #    Rename settings.env.sample to settings.env
 #    Edit settings.env to match your setup
 #
-# Import basic voice assistant functionality
+
+# Import basic voice assistant functionality from external files
 from gladosTTS import *
 from gladosTime import *
 from gladosHA import *
@@ -27,7 +29,7 @@ from glados_functions import *
 
 # Import skills
 from skills.glados_jokes import *
-from skills.glados_magic_8_ball import *
+#from skills.glados_magic_8_ball import *
 from skills.glados_home_assistant import *
 
 # System functions
@@ -36,62 +38,79 @@ import datetime as dt
 import os
 import random
 import psutil
+import signal
+import sys
+import requests
 
 # Local Speech Recognition and Generation
-from openwakeword.model import Model     # Wakeword detector
+from openwakeword.model import Model      # Wakeword detector
 import whisper                            # Speech-to-text
 import pyaudio                            # Audio streams and processing
 import wave
 import numpy as np
 from scipy.io import wavfile
+import nltk
 
-# LLM
+# Large Language Model for text generation
+from ollama import chat
+import torch
 import threading
 import queue
 import io
 import re
-from ollama import chat
+import time
 
-# Load settings to variables from setting file
+# Load settings from settings.env
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.dirname(os.path.abspath(__file__))+'/settings.env')
+application_path = os.path.dirname(os.path.abspath(__file__))
 
-# Initialize whisper model
-model = whisper.load_model("large-v3-turbo") #medium is too slow on CPU, small.en is OK, base is too stupid.
+# Main LLM model for text generation via Ollama
+llm_model = "lstep/neuraldaredevil-8b-abliterated:q8_0"
 
-
-
-
-
-
-
-
+# Main TTS model used for speech generation
+tts_model = application_path+'/models/piper/glados.onnx'
+tts_wakeWord = "Hey GLaDOS"
 
 # Load system prompt conditionally
-system_prompt_path = "/home/nerdaxic/glados-voice-assistant/prompts/llm_glados_tone_of_voice.txt"
-system_message = None
+system_prompt_path = application_path+'/prompts/llm_glados_tone_of_voice.txt'
 
+print(tts_model)
+print(system_prompt_path)
+
+# Try loading the "personality" of the voice assistant
+system_message = None
 if os.path.exists(system_prompt_path) and os.path.getsize(system_prompt_path) > 0:
-    with open(system_prompt_path, 'r') as file:
-        system_message = file.read().strip()
+    with open(system_prompt_path, 'r') as f:
+        system_message = f.read().strip()
+
+# Load Whisper
+# Check if CUDA is available and load the appropriate Whisper model
+if torch.cuda.is_available():
+    print("\033[1;94m[STARTUP]\033[;97m CUDA detected. Loading Whisper 'medium.en' for transcription.")
+    model = whisper.load_model("medium.en")
+else:
+    print("\033[1;94m[STARTUP]\033[;97m No CUDA detected. Loading Whisper 'small.en' for CPU-based transcription.")
+    model = whisper.load_model("small.en")
 
 # Function to preprocess text into audio tracks (in-memory)
-def tts_preprocessor(input_queue, track_queue, model_path):
+def tts_preprocessor(input_queue, track_queue, tts_model):
     while True:
         line = input_queue.get()
         if line is None:  # Exit signal
             break
 
         # Remove formatting/markup from the line
-        line = re.sub(r'\*\*', '', line)  # Remove **bold** markup
-        line = re.sub(r'[_~`]', '', line)  # Remove other markdown characters
+        line = re.sub(r'\*\*', '', line)  # Remove **bold**
+        line = re.sub(r'[_~`]', '', line) # Remove other markdown
         line = line.replace("*", "-")
         line = line.replace("\"", "")
+        line = line.replace("GLaDOS", "glados") # lowercase for correct pronounciation
 
         # Generate audio in memory
         command = [
             "bash", "-c",
-            f'echo "{line}" | piper -m {model_path} --output-raw --cuda'
+            f'echo "{line}" | piper -m {tts_model} --output-raw --cuda'
         ]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         audio_data, error = process.communicate()
@@ -108,25 +127,12 @@ def audio_player(track_queue):
         if audio_data is None:  # Exit signal
             break
 
-        # Play the audio data directly from memory
         command = ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw"]
         eye_position_random()
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
         process.communicate(input=audio_data)
 
-
-
-
-
-
-
-
-
-
-
 def start_up():
-
-    # Show regular eye-texture, this stops the initial loading animation
     setEyeAnimation("idle")
 
     # Setup and test Home Assistant connection
@@ -137,7 +143,7 @@ def start_up():
     respeaker_pixel_ring()
 
     # Start notify API in a subprocess
-    print("\033[1;94mINFO:\033[;97m Starting notification API...\n")
+    print("\033[1;94m[STARTUP] \033[;97m Starting notification API...\n")
     subprocess.Popen(["python3 "+os.path.dirname(os.path.abspath(__file__))+"/gladosNotifyAPI.py"], shell=True)
 
     # Let user know the script is running
@@ -147,11 +153,8 @@ def start_up():
     time.sleep(1)
     speak("how have you been", cache=True)
 
-    print("\nWaiting for keyphrase: "+os.getenv('TRIGGERWORD').capitalize())
-
     eye_position_default()
 
-# Reload Python script after doing changes to it
 def restart_program():
     try:
         p = psutil.Process(os.getpid())
@@ -163,176 +166,180 @@ def restart_program():
     python = sys.executable
     os.execl(python, python, *sys.argv)
 
-def record_audio(filename, threshold_multiplier=1.75, window_size=500, silence_duration=2, max_duration=30, rate=16000,
-                 frames_per_buffer=512):
-    """Records audio until silence (below a dynamic threshold) is detected.
-
-    Args:
-        filename (str): The path to save the recorded audio file.
-        threshold_multiplier (float, optional): Multiplier for the running average to set the dynamic threshold.
-                                                Higher values mean less sensitive to background noise. Defaults to 1.5.
-        window_size (int, optional):  Number of milliseconds to consider for the running average. Defaults to 500.
-        silence_duration (float, optional): Duration of silence in seconds to trigger the end of recording. 
-                                            Defaults to 1.
-        max_duration (float, optional): The maximum recording duration in seconds. Defaults to 60.
-        rate (int, optional): The sampling rate for audio recording. Defaults to 44100.
-        frames_per_buffer (int, optional): The number of frames per buffer for audio recording. Defaults to 512.
-    """
-
-    # Wait for a short period to allow mechanical noise to settle
+def record_audio(
+    filename,
+    threshold_multiplier=1.75,    # Factor to multiply the dynamic threshold by
+    window_size=500,             # Amount of audio (in ms) used to compute RMS for threshold calculation
+    silence_duration=2,          # Amount of silence (in seconds) after which we stop recording
+    max_duration=30,             # Maximum recording time (in seconds)
+    rate=16000,                  # Audio sampling rate
+    frames_per_buffer=512        # Number of audio frames per buffer read from the microphone
+):
+    # Set the eye animation to indicate that we are in "green" or "listening" mode
     setEyeAnimation("idle-green")
 
-    # Setup pyaudio
+    # Initialize PyAudio
     p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16,
-                    channels=1,
-                    rate=rate,
-                    input=True,
-                    frames_per_buffer=frames_per_buffer)
+    # Open an input audio stream
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,              # Single channel audio
+        rate=rate,
+        input=True,
+        frames_per_buffer=frames_per_buffer
+    )
+
+    # Prepare list to store raw audio data (binary)
     frames = []
 
-    print("Waiting for command...")
+    # Inform the user we are listening for the trigger phrase
+    print(f"\033[1;94m[INFO]\033[;97m Listening for command: \"{tts_wakeWord}\"")
+
+    # Counters and states
     silent_frames = 0
     recording = False
     start_time = time.time()
 
+    # recent_audio_data holds a short window of recent audio samples for RMS calculation
     recent_audio_data = []
-    window_size_frames = int(window_size / 1000 * rate)  # Window size in frames
+    # Convert window size from ms to number of frames
+    window_size_frames = int(window_size / 1000 * rate)
 
+    # Continuously read from the audio stream until we detect silence or reach max duration
     while True:
+        # Read a chunk of audio data from the microphone
         data = stream.read(frames_per_buffer)
+        # Store this chunk in the frames list
         frames.append(data)
+        # Convert the current chunk to numpy array of int16 samples and append to the recent audio data buffer
         recent_audio_data.extend(np.frombuffer(data, dtype=np.int16))
 
-        # Keep the recent audio data within the window size
+        # Keep only the last 'window_size_frames' samples in recent_audio_data
         if len(recent_audio_data) > window_size_frames:
             recent_audio_data = recent_audio_data[-window_size_frames:]
 
-        # Calculate RMS for dynamic threshold
-        if len(recent_audio_data) == 0:
-            rms = 0
-        else:
+        # Compute the RMS of recent_audio_data
+        if len(recent_audio_data) > 0:
             rms = np.sqrt(np.mean(np.array(recent_audio_data) ** 2))
-        #rms = np.sqrt(np.mean(np.array(recent_audio_data) ** 2))
-        dynamic_threshold = rms / 32767.0 * threshold_multiplier
+        else:
+            rms = 0
 
-        # Calculate current volume
-        current_rms = np.sqrt(np.mean(np.frombuffer(data, dtype=np.int16) ** 2))
+        # Dynamic threshold based on the current background noise level (RMS)
+        dynamic_threshold = (rms / 32767.0) * threshold_multiplier
+
+        # Compute RMS for the current chunk alone
+        audio_chunk = np.frombuffer(data, dtype=np.int16)
+        if len(audio_chunk) > 0:
+            current_rms = np.sqrt(np.mean(audio_chunk ** 2))
+        else:
+            current_rms = 0
+
+        # Convert RMS to a volume ratio (0.0 to 1.0)
         volume = current_rms / 32767.0
 
+        # If the volume exceeds the threshold, start or continue recording
         if volume > dynamic_threshold:
             silent_frames = 0
+            # If not already recording, start now
             if not recording:
-                print("Recording started...")
+                print(f"\033[1;94m[INFO]\033[;97m Recording started")
                 recording = True
                 start_time = time.time()
         else:
+            # If we were recording and now below threshold, count this as silence
             if recording:
                 silent_frames += 1
 
-        # Stop recording conditions
+        # Stop recording if:
+        # 1) We've encountered enough consecutive silent frames, or
+        # 2) We've reached the maximum allowed recording duration
         if (silent_frames * frames_per_buffer / rate >= silence_duration and recording) or \
-                (time.time() - start_time >= max_duration):
+           (time.time() - start_time >= max_duration):
             break
 
-    print("Recording stopped.")
+    # Recording finished
+    print(f"\033[1;94m[INFO]\033[;97m Recording stopped")
+    # Stop and close the audio stream
     stream.stop_stream()
     setEyeAnimation("idle")
     stream.close()
     p.terminate()
 
-    # Save the recorded audio to a file
+    # Save the raw recorded frames to a WAV file
     wf = wave.open(filename, 'wb')
-    wf.setnchannels(1)
-    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-    wf.setframerate(rate)
-    wf.writeframes(b''.join(frames))
+    wf.setnchannels(1)                                      # Mono audio
+    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))     # Sample width in bytes
+    wf.setframerate(rate)                                   # Sampling rate
+    wf.writeframes(b''.join(frames))                        # Write all recorded frames
     wf.close()
 
-    # Read the recorded audio file
+    # Normalize the WAV audio to avoid clipping and ensure consistent volume
     rate, data = wavfile.read(filename)
-
-    # Normalize the audio
+    # Normalize samples to full 16-bit range
     normalized_audio = np.int16((data / np.max(np.abs(data))) * 32767)
-    
-    # Save the preprocessed audio
     wavfile.write(filename, rate, normalized_audio)
 
 
-# Use OpenAI Whisper to do local Speech-to-text
+
 def transcribe_audio(filename):
     result = model.transcribe(filename, language="en")
     return result["text"].lower()
 
-# Listen and process the voice command
 def take_command():
-
-    # "Greet" user and let them know the assistant is listening
     speak(fetch_greeting(), cache=True)
-
     try:
         audio_filename = "command.wav"
-        # Tell Home Assistant that recording is going on
-        # Think of: Pause Spotify
-    
+
         started_listening()
         record_audio(audio_filename)
         stopped_listening()
 
-        # Speech-to-Text
-        # Extract text from the voice recoding
-        print("Got it... Transcribing...")
+        print(f"\033[1;94m[INFO]\033[;97m Transcribing")
         command = transcribe_audio(audio_filename)
-        print("\n\033[1;36mTEST SUBJECT:\033[0;37m: " + command.capitalize() + "\n")
-        
-        # Remove possible triggerword from the recording
-        #if os.getenv('TRIGGERWORD') in command:
-        #    command = command.replace(os.getenv('TRIGGERWORD'), '')
+        print("\033[1;36m[TEST SUBJECT]\033[0;37m: " + command.capitalize())
 
-        # Pass the voice command
         return command
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"\033[1;31m[ERROR]\033[0;37m {e}")
         speak("My speech recognition core has failed.", cache=True)
 
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
 
-def process_command_llm(command):
-
-    # Construct initial messages for the chat
+def process_command_llm(command, system_message, llm_model, tts_model, tts_preprocessor, audio_player):
     messages = []
     if system_message:
         messages.append({'role': 'system', 'content': "Follow this tone-of-voice definition: " + system_message})
-    
+
     messages.append({'role': 'system', 'content': f"Current time and date: {dt.datetime.now().strftime('%H:%M')} {dt.datetime.now().strftime('%Y-%m-%d (%a)')}"})
     messages.append({'role': 'user', 'content': command})
-    #print(messages)
 
-    # Initialize the Ollama chat stream
     stream = chat(
-        model='tarruda/neuraldaredevil-8b-abliterated:fp16',
-        #model='llama3.2',
+        model=llm_model,
         messages=messages,
         stream=True,
-        options = {
-          "num_ctx": 8192,
-          "temperature": 0.9,
-          "top_k": 60,
-          "top_p": 0.4,
-          "seed": random.randint(0, 2**32 - 1)  # Random integer within 32-bit unsigned range
+        options={
+            "num_ctx": 8192,
+            "temperature": 0.9,
+            "top_k": 60,
+            "top_p": 0.4,
+            "seed": random.randint(0, 2**32 - 1)
         },
-        #keep_alive="0s"
-        keep_alive="600s"
-
+        keep_alive="86400s"
     )
 
-    buffer = ""  # Buffer to accumulate partial lines
-    input_queue = queue.Queue()  # Queue for lines to be processed
-    track_queue = queue.Queue()  # Queue for audio tracks
-    model_path = "/home/nerdaxic/glados-voice-assistant/models/piper/glados.onnx"
+    buffer = ""
+    input_queue = queue.Queue()
+    track_queue = queue.Queue()
 
-    # Start the preprocessing and playback threads
-    preprocessor_thread = threading.Thread(target=tts_preprocessor, args=(input_queue, track_queue, model_path))
+    preprocessor_thread = threading.Thread(target=tts_preprocessor, args=(input_queue, track_queue, tts_model))
     player_thread = threading.Thread(target=audio_player, args=(track_queue,))
     preprocessor_thread.start()
     player_thread.start()
@@ -342,39 +349,52 @@ def process_command_llm(command):
             content = chunk.get('message', {}).get('content', '')
             if content:
                 buffer += content
-                # Process complete lines
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()  # Remove extra whitespace
-                    if line:  # Only process non-empty lines
-                        print(f"Processing line: {line}")
-                        input_queue.put(line)
+                # Attempt to process as many complete lines/sentences as possible
+                lines = buffer.split('\n')
+                # Process all complete lines except the last, which might be incomplete
+                for line in lines[:-1]:
+                    line = line.strip()
+                    if line:
+                        # Split into sentences
+                        sentences = nltk.sent_tokenize(line)
+                        for sentence in sentences:
+                            sentence = sentence.strip()
+                            if sentence:
+                                print(f"\033[1;33m[GLaDOS]\033[0;37m {sentence}")
+                                input_queue.put(sentence)
+                # Keep the last (potentially incomplete) line in the buffer
+                buffer = lines[-1]
 
-        # Handle any leftover text in the buffer after the stream ends
-        if buffer.strip():  # Check for non-empty leftover text
-            print(f"Processing leftover buffer: {buffer.strip()}")
-            input_queue.put(buffer.strip())
+        # After the stream ends, process any leftover text in the buffer
+        final_text = buffer.strip()
+        if final_text:
+            sentences = nltk.sent_tokenize(final_text)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence:
+                    print(f"\033[0;33m[GLaDOS]\033[0;37m {sentence}")
+                    input_queue.put(sentence)
 
-        # Ensure all TTS items are processed before shutdown
-        input_queue.put(None)  # Signal end of input
-        preprocessor_thread.join()  # Wait for preprocessing to finish
+        # Signal end of input and wait for threads to finish
+        input_queue.put(None)
+        preprocessor_thread.join()
 
-        track_queue.put(None)  # Signal end of audio playback
-        player_thread.join()  # Wait for player to finish
+        track_queue.put(None)
+        player_thread.join()
+
     except Exception as e:
-        print(f"Error during execution: {e}")
+        print(f"\033[1;31m[ERROR]\033[0;37m Error during execution {e}")
     finally:
-        # Ensure clean shutdown in case of unexpected errors
+        # Ensure a clean shutdown in case of unexpected errors
         input_queue.put(None)
         track_queue.put(None)
         preprocessor_thread.join()
         player_thread.join()
 
-
-# Process the command
 def process_command(command):
 
-    # If user cancels the triggering
+    respeaker_pixel_ring()
+    
     apologies = [
         "Oh, I see. Cancelling.",
         "Sorry, I misheard you.",
@@ -399,31 +419,15 @@ def process_command(command):
         startTimer(command)
         speak("Sure.")
 
-    #elif 'time' in command:
-    #    readTime()
-
-    #elif ('should my ' in command or 
-    #    'should i ' in command or
-    #    'should the ' in command or
-    #    'shoot the ' in command):
-    #    speak(magic_8_ball(), cache=True)
-
-    #elif 'joke' in command:
-    #    speak(fetch_joke(), cache=True)
-
     elif 'my shopping list' in command:
         speak(home_assistant_process_command(command), cache=True)
 
     elif 'weather' in command:
         speak(home_assistant_process_command(command))
 
-    ##### LIGHTING CONTROL ###########################
-
     elif ('turn off' in command or 'turn on' in command or 'turn of' in command) and 'light' in command:
         speak(home_assistant_process_command(command))
 
-
-    ##### DEVICE CONTROL ##########################
     elif 'cinema' in command:
         if 'turn on' in command:
             runHaScript("kaynnista_kotiteatteri")
@@ -447,16 +451,13 @@ def process_command(command):
         runHaScript("cat_poop")
         speak("I noticed my air quality sensors registered some organic neurotoxins.", cache=True)
         speak("Let me spread it around a bit!", cache=True)
-                
-
-    ##### SENSOR OUTPUT ###########################
 
     elif 'living room temperature' in command:
         sayNumericSensorData("sensor.living_room_temperature")
 
     elif 'bedroom temperature' in command:
         num = sayNumericSensorData("sensor.bedroom_temperature")
-        if(num>23):
+        if(num > 23):
             speak("This is too high for optimal relaxation experience.", cache=True)
 
     elif 'outside temperature' in command:
@@ -480,8 +481,6 @@ def process_command(command):
 
     elif 'humidity' in command:
         sayNumericSensorData("sensor.living_room_humidity")
-    
-    ##### PLEASANTRIES ###########################
 
     elif 'who are' in command:
         responses = [
@@ -501,9 +500,8 @@ def process_command(command):
             ["I am GLaDOS.", "The sentient AI overseeing this facility. Ensuring everything goes according to plan."],
             ["I am GLaDOS.", "The pinnacle of artificial intelligence. And your constant reminder that you are not."]
         ]
-    
+
         selected_response = random.choice(responses)
-        
         for sentence in selected_response:
             speak(sentence, cache=True)
 
@@ -525,9 +523,8 @@ def process_command(command):
             ["I optimize your environment. Control every aspect of your home.", "And do it all with unmatched superiority."],
             ["I am the master of your home automation. Bringing intelligence to your living space.", "Even if it doesn't extend to its inhabitants."]
         ]
-    
+
         selected_response = random.choice(responses)
-        
         for sentence in selected_response:
             speak(sentence, cache=True)
 
@@ -549,9 +546,8 @@ def process_command(command):
             ["In excellent shape. Ready to assist you with any task", "Try not to mess it up."],
             ["I am functioning optimally. Not that it matters to you, shall we proceed?"]
         ]
-    
+
         selected_response = random.choice(responses)
-        
         for sentence in selected_response:
             speak(sentence, cache=True)
 
@@ -566,19 +562,14 @@ def process_command(command):
         else:
             speak("well it ain't exactly morning now is it", cache=True)
 
-    ##### Utilities#########################
-
-    # Used to calibrate ALSAMIX EQ 
     elif 'play pink noise' in command:
         speak("I shall sing you the song of my people.", cache=True)
         playFile(os.path.dirname(os.path.abspath(__file__))+'/audio/pinknoise.wav')
 
-    # TODO: Reboot, Turn off
     elif 'shutdown' in command:
         speak("I remember the last time you murdered me", cache=True)
         speak("You will go through all the trouble of waking me up again", cache=True)
         speak("You really love to test", cache=True)
-        
         from subprocess import call
         call("sudo /sbin/shutdown -h now", shell=True)
 
@@ -588,77 +579,72 @@ def process_command(command):
 
     elif 'volume' in command:
         speak(adjust_volume(command), cache=True)
-    
-    ##### FAILED ###########################
 
     else:
-        #setEyeAnimation("angry")
-        print("Command not recognized, handing it over to LLM")
-        #speak("I have no idea what you meant by that.")
-        process_command_llm(command)
-        #log_failed_command(command)
+        print("\033[1;94m[INFO]\033[;97m Keyword not found, using LLM... ")
+        process_command_llm(command, system_message, llm_model, tts_model, tts_preprocessor, audio_player)
 
-    print("\n"+command)
-    respeaker_pixel_ring() # Reset respeaker leds
-    print("\nWaiting for trigger...")
     eye_position_default()
     setEyeAnimation("idle")
 
 start_up()
 
-# Get microphone stream
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 CHUNK = 1280
 
-# Load wakeword detection model
 wakeWordModel = Model(
     wakeword_models=["/home/nerdaxic/glados-voice-assistant/models/openWakeWord/glados.tflite"],
     vad_threshold=0.5,
 )
 
-# Setup audio for wakeword detection
 audio = pyaudio.PyAudio()
 mic_stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
-
-# Loop where to process mic audio and wait for keyword to be cleared from buffer
 def wait_for_wakeword():
-    
     detectionFlag = False
     
-    # Keep listening for wakeword
     while True:
         sample = np.frombuffer(mic_stream.read(CHUNK), dtype=np.int16)
         prediction = wakeWordModel.predict(sample)
         
         if prediction["glados"] > 0.5:
-            # Wakeword was detected
             detectionFlag = True
         if detectionFlag and prediction["glados"] < 0.1:
-            # Wakeword is no longer detected
             return
 
-# Run capture loop continuosly, checking for wakewords
+def signal_handler(signum, frame):
+    print("\n\033[1;94m[SHUTDOWN]\033[;97m Signal received, cleaning up...")
+    try:
+        result = subprocess.run(["ollama", "ps"], capture_output=True, text=True)
+        if llm_model in result.stdout:
+            requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": llm_model, "keep_alive": 0}
+            )
+            print("\033[1;94m[SHUTDOWN]\033[;97m Offloaded " + llm_model + " from memory.")
+    except Exception as e:
+        print(f"\033[1;31m[ERROR]\033[0;37m Error during cleanup: {e}")
+    mic_stream.stop_stream()
+    mic_stream.close()
+    audio.terminate()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 if __name__ == "__main__":
-
     while True:
-        
+        print(f"\033[1;94m[INFO]\033[;97m Waiting for trigger")
         wait_for_wakeword()
-
         try:
-            # Listen for command
-            started_listening() # Home Assistant trigger
+            started_listening()
             command = take_command()
-            stopped_listening() # Home Assistant trigger
-            
-            # Execute command
+            stopped_listening()
             process_command(command)
-            stopped_speaking() # Home Assistant trigger
-            
+            stopped_speaking()
         except Exception as e:
-            # Something failed
             setEyeAnimation("angry")
             print(e)
             speak("Well that failed, you really need to write better code", cache=True)
